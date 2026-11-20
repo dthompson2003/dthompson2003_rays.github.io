@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HW 7 - Ray Tracing, Glass, Metal, and Water</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 18px; background: #11151b; color: #d8dee9; font-family: monospace; }
+  h2 { margin: 0 0 8px; }
+  p { line-height: 1.45; color: #b8c2d1; }
+  .layout { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+  .editors { display: flex; flex-direction: column; gap: 10px; }
+  textarea {
+    background: #202833; color: #9fe6a0; border: 1px solid #455366;
+    font: 12px/1.35 monospace; width: min(440px, 92vw); height: 185px;
+    box-sizing: border-box; white-space: pre; tab-size: 4;
+  }
+  #shaderError { color: #ff8585; white-space: pre-wrap; width: min(440px, 92vw); margin: 0; }
+  canvas { border: 1px solid #536174; max-width: 100%; height: auto; touch-action: none; background: #090d13; }
+  .controls { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 9px 18px; max-width: 850px; }
+  .control-row { display: grid; grid-template-columns: 145px 1fr 42px; gap: 8px; align-items: center; }
+  input[type=range] { width: 100%; accent-color: #68b7ff; }
+  .hint { color: #93a4b8; font-size: 12px; }
+  b { color: #fff; }
+</style>
+</head>
+<body>
+<h2>HW 7 — Ray Tracing: Glass, Metal & Animated Water</h2>
+<p>
+  Drag on the canvas to orbit the camera. The red sphere is metallic, the green cube is glass,
+  and the checker-free surface is an animated water height field with reflection and refraction.
+  Use the controls to experiment with ray bounces, lighting, materials, and wave motion.
+</p>
+
+<div class="layout">
+  <div class="editors">
+    <div><b>Vertex Shader</b><br><textarea id="vertEditor" spellcheck="false"></textarea></div>
+    <div><b>Fragment Shader</b><br><textarea id="fragEditor" spellcheck="false"></textarea></div>
+    <pre id="shaderError"></pre>
+  </div>
+  <div>
+    <canvas id="glcanvas" width="720" height="450"></canvas>
+    <div class="controls">
+      <div class="control-row"><label for="bounces">Max bounces</label><input type="range" id="bounces" min="1" max="10" value="6"><span id="bouncesValue">6</span></div>
+      <div class="control-row"><label for="ambient">Ambient strength</label><input type="range" id="ambient" min="0" max="0.5" step="0.01" value="0.07"><span id="ambientValue">0.07</span></div>
+      <div class="control-row"><label for="shininess">Metal shininess</label><input type="range" id="shininess" min="8" max="160" step="1" value="72"><span id="shininessValue">72</span></div>
+      <div class="control-row"><label for="lightPower">Light intensity</label><input type="range" id="lightPower" min="0.2" max="6" step="0.1" value="3"><span id="lightPowerValue">3.0</span></div>
+      <div class="control-row"><label for="waterSpeed">Water speed</label><input type="range" id="waterSpeed" min="0" max="3" step="0.05" value="1"><span id="waterSpeedValue">1.00</span></div>
+      <div class="control-row"><label for="waveHeight">Wave height</label><input type="range" id="waveHeight" min="0" max="0.35" step="0.01" value="0.13"><span id="waveHeightValue">0.13</span></div>
+    </div>
+    <div class="hint">Tip: increase bounces to see more inter-object reflections; reduce ambient to make shadows stronger.</div>
+  </div>
+</div>
+
+<script id="vertex-shader" type="x-shader/x-vertex">#version 300 es
+in vec2 position;
+void main() {
+    gl_Position = vec4(position, 0.0, 1.0);
+}
+</script>
+
+<script id="fragment-shader" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+precision highp int;
+
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform int u_maxBounces;
+uniform float u_ambientStrength;
+uniform vec2 u_cameraOrbit;
+uniform float u_shininess;
+uniform float u_lightPower;
+uniform float u_waterSpeed;
+uniform float u_waveHeight;
+
+out vec4 fragColor;
+
+const float FLOOR_Y = -2.0;
+const float GLASS_IOR = 1.50;
+const float WATER_IOR = 1.333;
+const float EPSILON = 0.001;
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+struct Sphere {
+    vec3 center;
+    float radius;
+    vec3 color;
+};
+struct Cube {
+    vec3 center;
+    float halfSize;
+    vec3 color;
+    float reflectivity;
+};
+struct HitData {
+    bool hit;
+    float t;
+    vec3 point;
+    vec3 normal;
+    vec3 color;
+    float reflectivity;
+    bool isLight;
+    bool isGlass;
+    bool isWater;
+};
+
+const Sphere lightSphere = Sphere(vec3(4.0, 3.0, -4.0), 0.28, vec3(1.0, 0.88, 0.68));
+Sphere lightSphere2;
+Sphere metalSphere;
+Cube glassCube;
+
+void initScene(float time) {
+    float a = time * 0.48;
+    metalSphere = Sphere(
+        vec3(cos(a) * 2.15, sin(a * 1.2) * 0.55, -5.8 + sin(a) * 0.35),
+        0.92,
+        vec3(0.82, 0.30, 0.12)
+    );
+
+    // A second, slowly orbiting blue light makes the colored reflections move.
+    float l = time * 0.32;
+    lightSphere2 = Sphere(
+        vec3(-3.2 + cos(l) * 0.75, 2.1 + sin(l * 1.4) * 0.35, -5.0 + sin(l) * 0.8),
+        0.24,
+        vec3(0.35, 0.58, 1.0)
+    );
+
+    // The cube is a dielectric glass object, not a diffuse/metallic cube.
+    glassCube = Cube(vec3(0.15, -0.05, -8.2), 0.88, vec3(0.68, 0.88, 1.0), 0.0);
+}
+
+bool intersectSphere(Ray ray, Sphere s, out float t) {
+    vec3 oc = ray.origin - s.center;
+    float b = dot(oc, ray.direction);
+    float d = b * b - dot(oc, oc) + s.radius * s.radius;
+    if (d < 0.0) return false;
+    float root = sqrt(d);
+    t = -b - root;
+    if (t < EPSILON) t = -b + root;
+    return t > EPSILON;
+}
+
+bool intersectCube(Ray ray, out float t, out vec3 normal) {
+    vec3 lo = glassCube.center - vec3(glassCube.halfSize);
+    vec3 hi = glassCube.center + vec3(glassCube.halfSize);
+    vec3 d = ray.direction;
+    vec3 safeDir = vec3(
+        abs(d.x) < 0.00001 ? (d.x < 0.0 ? -0.00001 : 0.00001) : d.x,
+        abs(d.y) < 0.00001 ? (d.y < 0.0 ? -0.00001 : 0.00001) : d.y,
+        abs(d.z) < 0.00001 ? (d.z < 0.0 ? -0.00001 : 0.00001) : d.z
+    );
+    vec3 t0s = (lo - ray.origin) / safeDir;
+    vec3 t1s = (hi - ray.origin) / safeDir;
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar = min(min(tmax.x, tmax.y), tmax.z);
+    if (tFar < max(tNear, 0.0)) return false;
+    t = tNear > EPSILON ? tNear : tFar;
+    if (t < EPSILON) return false;
+
+    vec3 local = ray.origin + ray.direction * t - glassCube.center;
+    vec3 a = abs(local);
+    if (a.x >= a.y && a.x >= a.z) normal = vec3(sign(local.x), 0.0, 0.0);
+    else if (a.y >= a.z) normal = vec3(0.0, sign(local.y), 0.0);
+    else normal = vec3(0.0, 0.0, sign(local.z));
+    return true;
+}
+
+// Smooth traveling height field: two crossing waves prevent the surface from
+// looking like a single regular sine wave.
+float waterHeight(vec2 xz) {
+    float t = u_time * u_waterSpeed;
+    float w1 = sin(xz.x * 1.35 + t * 1.35) * cos(xz.y * 1.05 - t);
+    float w2 = sin((xz.x + xz.y) * 0.78 - t * 0.72);
+    return FLOOR_Y + u_waveHeight * (0.68 * w1 + 0.32 * w2);
+}
+vec3 waterNormal(vec2 xz) {
+    float e = 0.025;
+    float hx1 = waterHeight(xz + vec2(e, 0.0));
+    float hx0 = waterHeight(xz - vec2(e, 0.0));
+    float hz1 = waterHeight(xz + vec2(0.0, e));
+    float hz0 = waterHeight(xz - vec2(0.0, e));
+    float dx = (hx1 - hx0) / (2.0 * e);
+    float dz = (hz1 - hz0) / (2.0 * e);
+    return normalize(vec3(-dx, 1.0, -dz));
+}
+
+// Intersect a ray with the animated water height field. We march along the ray,
+// find a sign change, then refine the crossing with bisection.
+bool intersectWater(Ray ray, out float tHit, out vec3 normal) {
+    float tPrev = 0.01;
+    vec3 pPrev = ray.origin + ray.direction * tPrev;
+    float fPrev = pPrev.y - waterHeight(pPrev.xz);
+    const int STEPS = 180;
+    for (int i = 0; i < STEPS; ++i) {
+        float tNow = tPrev + 0.10;
+        vec3 pNow = ray.origin + ray.direction * tNow;
+        float fNow = pNow.y - waterHeight(pNow.xz);
+        if ((fPrev >= 0.0 && fNow <= 0.0) || (fPrev <= 0.0 && fNow >= 0.0)) {
+            float a = tPrev;
+            float b = tNow;
+            float fa = fPrev;
+            for (int j = 0; j < 7; ++j) {
+                float m = 0.5 * (a + b);
+                vec3 pm = ray.origin + ray.direction * m;
+                float fm = pm.y - waterHeight(pm.xz);
+                if ((fa >= 0.0 && fm >= 0.0) || (fa <= 0.0 && fm <= 0.0)) {
+                    a = m;
+                    fa = fm;
+                } else {
+                    b = m;
+                }
+            }
+            tHit = 0.5 * (a + b);
+            vec3 p = ray.origin + ray.direction * tHit;
+            // Keep the water's geometric normal pointing upward. The trace
+            // routine uses the ray/normal sign to distinguish entering vs exiting.
+            normal = waterNormal(p.xz);
+            return tHit > EPSILON;
+        }
+        tPrev = tNow;
+        fPrev = fNow;
+    }
+    return false;
+}
+
+HitData emptyHit() {
+    return HitData(false, 1e10, vec3(0.0), vec3(0.0), vec3(0.0), 0.0, false, false, false);
+}
+
+HitData traceScene(Ray ray, bool includeLights) {
+    HitData hit = emptyHit();
+    float t;
+    vec3 n;
+
+    if (includeLights && intersectSphere(ray, lightSphere, t) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, vec3(0.0),
+                      lightSphere.color, 0.0, true, false, false);
+    }
+    if (includeLights && intersectSphere(ray, lightSphere2, t) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, vec3(0.0),
+                      lightSphere2.color, 0.0, true, false, false);
+    }
+
+    if (intersectWater(ray, t, n) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        hit = HitData(true, t, p, n, vec3(0.22, 0.55, 0.68), 0.0, false, false, true);
+    }
+
+    if (intersectCube(ray, t, n) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        hit = HitData(true, t, p, n, glassCube.color, 0.0, false, true, false);
+    }
+
+    if (intersectSphere(ray, metalSphere, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        hit = HitData(true, t, p, normalize(p - metalSphere.center),
+                      metalSphere.color, 0.94, false, false, false);
+    }
+    return hit;
+}
+
+float schlick(float cosine, float etaI, float etaT) {
+    float r0 = (etaI - etaT) / (etaI + etaT);
+    r0 *= r0;
+    return r0 + (1.0 - r0) * pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0);
+}
+
+vec3 lightContribution(HitData hit, Ray ray, Sphere light) {
+    vec3 toLight = light.center - hit.point;
+    float lightDist = length(toLight);
+    vec3 lightDir = toLight / max(lightDist, 0.0001);
+    Ray shadowRay = Ray(hit.point + hit.normal * 0.004, lightDir);
+    HitData blocker = traceScene(shadowRay, false);
+    float visible = (blocker.hit && blocker.t < lightDist - 0.01) ? 0.0 : 1.0;
+
+    float ndotl = max(dot(hit.normal, lightDir), 0.0);
+    vec3 viewDir = normalize(-ray.direction);
+    vec3 reflectedLight = reflect(-lightDir, hit.normal);
+    float spec = pow(max(dot(viewDir, reflectedLight), 0.0), u_shininess);
+    float falloff = 1.0 / (1.0 + 0.075 * lightDist * lightDist);
+    vec3 diffuse = hit.color * ndotl;
+    vec3 specular = vec3(0.9) * spec * 0.7;
+    return (diffuse + specular) * light.color * u_lightPower * falloff * visible;
+}
+
+vec3 trace(Ray ray) {
+    vec3 result = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (int bounce = 0; bounce < 10; ++bounce) {
+        if (bounce >= u_maxBounces) break;
+        HitData hit = traceScene(ray, true);
+
+        if (!hit.hit) {
+            float skyT = 0.5 * (ray.direction.y + 1.0);
+            vec3 sky = mix(vec3(0.035, 0.055, 0.085), vec3(0.20, 0.30, 0.43), skyT);
+            result += throughput * sky;
+            break;
+        }
+
+        if (hit.isLight) {
+            result += throughput * hit.color * u_lightPower;
+            break;
+        }
+
+        // Glass cube and water both use dielectric Fresnel reflection/refraction.
+        if (hit.isGlass || hit.isWater) {
+            bool entering = dot(ray.direction, hit.normal) < 0.0;
+            vec3 N = entering ? hit.normal : -hit.normal;
+            float etaI = entering ? 1.0 : (hit.isWater ? WATER_IOR : GLASS_IOR);
+            float etaT = entering ? (hit.isWater ? WATER_IOR : GLASS_IOR) : 1.0;
+            float eta = etaI / etaT;
+            float cosTheta = clamp(dot(-ray.direction, N), 0.0, 1.0);
+            vec3 refractedDir = refract(ray.direction, N, eta);
+            bool totalInternalReflection = dot(refractedDir, refractedDir) < 0.000001;
+            float fresnel = schlick(cosTheta, etaI, etaT);
+
+            // Choose one path per bounce (a compact stochastic-style approximation).
+            // TIR always reflects; otherwise Fresnel determines the reflection chance.
+            if (totalInternalReflection || fresnel > 0.32) {
+                vec3 reflectedDir = normalize(reflect(ray.direction, N));
+                throughput *= hit.isWater ? vec3(0.92, 0.98, 1.0) : vec3(0.96, 0.985, 1.0);
+                ray = Ray(hit.point + reflectedDir * 0.004, reflectedDir);
+            } else {
+                vec3 transmittedDir = normalize(refractedDir);
+                if (hit.isWater) throughput *= vec3(0.88, 0.97, 1.0);
+                else throughput *= vec3(0.94, 0.985, 1.0);
+                ray = Ray(hit.point + transmittedDir * 0.004, transmittedDir);
+            }
+            continue;
+        }
+
+        // Local Phong illumination from two independent point lights.
+        vec3 ambient = hit.color * u_ambientStrength;
+        vec3 direct = lightContribution(hit, ray, lightSphere)
+                    + lightContribution(hit, ray, lightSphere2);
+        if (hit.reflectivity > 0.0) {
+            result += throughput * (ambient + direct) * (1.0 - hit.reflectivity);
+            throughput *= hit.reflectivity;
+            vec3 reflectedDir = normalize(reflect(ray.direction, hit.normal));
+            ray = Ray(hit.point + reflectedDir * 0.004, reflectedDir);
+            continue;
+        } else {
+            result += throughput * (ambient + direct);
+            break;
+        }
+    }
+    return result;
+}
+
+void main() {
+    initScene(u_time);
+
+    float cp = cos(u_cameraOrbit.x), sp = sin(u_cameraOrbit.x);
+    float cy = cos(u_cameraOrbit.y), sy = sin(u_cameraOrbit.y);
+    mat3 rotX = mat3(1.0, 0.0, 0.0,  0.0, cp, -sp,  0.0, sp, cp);
+    mat3 rotY = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
+    mat3 camera = rotY * rotX;
+
+    vec3 target = vec3(0.0, -0.25, -5.7);
+    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    Ray ray = Ray(target + camera * vec3(0.0, 0.0, 7.2),
+                  normalize(camera * vec3(uv, -1.55)));
+
+    vec3 col = trace(ray);
+    col = col / (vec3(1.0) + col); // gentle tone mapping
+    fragColor = vec4(pow(max(col, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+}
+</script>
+
+<script>
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl2");
+const vertEditor = document.getElementById("vertEditor");
+const fragEditor = document.getElementById("fragEditor");
+const shaderError = document.getElementById("shaderError");
+
+if (!gl) {
+  shaderError.textContent = "WebGL 2 is not available in this browser.";
+  throw new Error("WebGL 2 unavailable");
+}
+
+vertEditor.value = document.getElementById("vertex-shader").textContent;
+fragEditor.value = document.getElementById("fragment-shader").textContent;
+
+function compile(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const message = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error(message);
+  }
+  return shader;
+}
+function createProgram(vsSource, fsSource) {
+  const vs = compile(gl.VERTEX_SHADER, vsSource);
+  const fs = compile(gl.FRAGMENT_SHADER, fsSource);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.bindAttribLocation(prog, 0, "position");
+  gl.linkProgram(prog);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    const message = gl.getProgramInfoLog(prog);
+    gl.deleteProgram(prog);
+    throw new Error(message);
+  }
+  return prog;
+}
+
+let program = null;
+function updateProgram() {
+  try {
+    const next = createProgram(vertEditor.value, fragEditor.value);
+    if (program) gl.deleteProgram(program);
+    program = next;
+    gl.useProgram(program);
+    shaderError.textContent = "";
+  } catch (e) {
+    shaderError.textContent = e.message.replace(/\0/g, "");
+  }
+}
+updateProgram();
+vertEditor.addEventListener("input", updateProgram);
+fragEditor.addEventListener("input", updateProgram);
+
+gl.bindVertexArray(gl.createVertexArray());
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.enableVertexAttribArray(0);
+
+const controlIds = ["bounces", "ambient", "shininess", "lightPower", "waterSpeed", "waveHeight"];
+for (const id of controlIds) {
+  const slider = document.getElementById(id);
+  const output = document.getElementById(id + "Value");
+  const updateLabel = () => {
+    const v = Number(slider.value);
+    output.textContent = id === "waterSpeed" || id === "waveHeight" || id === "ambient" || id === "lightPower"
+      ? v.toFixed(2) : String(v);
+  };
+  slider.addEventListener("input", updateLabel);
+  updateLabel();
+}
+
+// Drag to orbit. Pointer capture also supports touch screens.
+let pitch = 0.04, yaw = 0;
+let dragging = false;
+let lastX = 0, lastY = 0;
+canvas.addEventListener("pointerdown", e => {
+  dragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointerup", () => dragging = false);
+canvas.addEventListener("pointercancel", () => dragging = false);
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX;
+  const dy = e.clientY - lastY;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  yaw -= dx * 0.009;
+  pitch = Math.max(-0.35, Math.min(1.15, pitch + dy * 0.009));
+});
+
+function uniform(name) { return gl.getUniformLocation(program, name); }
+function render(ms) {
+  requestAnimationFrame(render);
+  if (!program) return;
+  gl.useProgram(program);
+  gl.uniform1f(uniform("u_time"), ms / 1000);
+  gl.uniform2f(uniform("u_resolution"), canvas.width, canvas.height);
+  gl.uniform1i(uniform("u_maxBounces"), Number(document.getElementById("bounces").value));
+  gl.uniform1f(uniform("u_ambientStrength"), Number(document.getElementById("ambient").value));
+  gl.uniform1f(uniform("u_shininess"), Number(document.getElementById("shininess").value));
+  gl.uniform1f(uniform("u_lightPower"), Number(document.getElementById("lightPower").value));
+  gl.uniform1f(uniform("u_waterSpeed"), Number(document.getElementById("waterSpeed").value));
+  gl.uniform1f(uniform("u_waveHeight"), Number(document.getElementById("waveHeight").value));
+  gl.uniform2f(uniform("u_cameraOrbit"), pitch, yaw);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
